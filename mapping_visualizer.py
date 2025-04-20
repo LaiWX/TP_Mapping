@@ -1,11 +1,27 @@
 import sys
 import csv
 import pandas as pd
-from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QPushButton, QToolTip, QStatusBar, QGridLayout, QDoubleSpinBox
-from PySide6.QtGui import QPainter, QColor, QPen, QPolygonF, QFont, QFontMetrics
-from PySide6.QtCore import Qt, QPointF, Signal, Slot, QSize, QRectF, QPoint
+import numpy as np
+from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QHBoxLayout, QPushButton, QToolTip, QStatusBar, QGridLayout, QDoubleSpinBox, QSizePolicy
+from PySide6.QtGui import QColor, QPen, QFont
+from PySide6.QtCore import Qt, QPointF, Signal, Slot, QSize, QRect, QPoint
+
+# matplotlib 相关导入
+import matplotlib
+matplotlib.use('QtAgg')
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from matplotlib.patches import Polygon, Circle
+import matplotlib.pyplot as plt
+from matplotlib.backend_bases import MouseButton
 import io
 
+# 新增导入
+from scipy.spatial import KDTree
+
+# 解决中文显示问题
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Bitstream Vera Sans', 'sans-serif']
+plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
 
 class MappingVisualizer(QMainWindow):
     def __init__(self):
@@ -17,6 +33,8 @@ class MappingVisualizer(QMainWindow):
         self.design_scale = 60.0  # 设计值缩放
         self.offset_scale = 1.0   # 偏移量缩放
         self.shot_separation = 4  # Shot分离参数
+        self.spec_x = 2.5        # X方向规格值
+        self.spec_y = 2.5        # Y方向规格值
 
         # 加载Seq数据
         self.seq_data = {}
@@ -26,6 +44,9 @@ class MappingVisualizer(QMainWindow):
         self.polygons = {}  # 理论多边形 {shot: {seq: point}}
         self.actual_polygons = {}  # 实际多边形 {GLASS_ID_ENDTIME: {shot: {seq: point}}}
         self.offset_data = {}  # 偏移量数据 {GLASS_ID_ENDTIME: {site_name: {param: value}}}
+        
+        # 均值多边形数据
+        self.mean_polygon = {}  # {shot: {seq: point}}
 
         # 创建UI
         self.setup_ui()
@@ -57,7 +78,8 @@ class MappingVisualizer(QMainWindow):
         main_layout.setSpacing(2)  # 减小组件间距
         
         # 绘图区域 - 放在最上方，占据主要空间
-        self.canvas = Canvas(self)
+        self.canvas = MatplotlibCanvas(self, self.seq_data)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         main_layout.addWidget(self.canvas, 1)  # 设置stretch因子为1，允许扩展
         
         # 添加参数控制区域
@@ -90,6 +112,24 @@ class MappingVisualizer(QMainWindow):
         self.shot_separation_spin.setValue(self.shot_separation)
         self.shot_separation_spin.valueChanged.connect(self.on_param_changed)
         params_layout.addWidget(self.shot_separation_spin, 0, 5)
+        
+        # X规格值
+        params_layout.addWidget(QLabel("X规格值:"), 1, 0)
+        self.spec_x_spin = QDoubleSpinBox()
+        self.spec_x_spin.setRange(0.0, 10.0)
+        self.spec_x_spin.setSingleStep(0.1)
+        self.spec_x_spin.setValue(self.spec_x)
+        self.spec_x_spin.valueChanged.connect(self.on_param_changed)
+        params_layout.addWidget(self.spec_x_spin, 1, 1)
+        
+        # Y规格值
+        params_layout.addWidget(QLabel("Y规格值:"), 1, 2)
+        self.spec_y_spin = QDoubleSpinBox()
+        self.spec_y_spin.setRange(0.0, 10.0)
+        self.spec_y_spin.setSingleStep(0.1)
+        self.spec_y_spin.setValue(self.spec_y)
+        self.spec_y_spin.valueChanged.connect(self.on_param_changed)
+        params_layout.addWidget(self.spec_y_spin, 1, 3)
         
         main_layout.addLayout(params_layout)
         
@@ -137,19 +177,21 @@ class MappingVisualizer(QMainWindow):
         self.design_scale = self.design_scale_spin.value()
         self.offset_scale = self.offset_scale_spin.value()
         self.shot_separation = self.shot_separation_spin.value()
+        self.spec_x = self.spec_x_spin.value()
+        self.spec_y = self.spec_y_spin.value()
         
         # 重新处理数据，刷新图表
         if hasattr(self, 'last_df') and self.last_df is not None:
             self.process_data(self.last_df)
         else:
-            self.canvas.set_params(self.design_scale, self.offset_scale, self.shot_separation)
-            self.canvas.update()
+            self.canvas.set_params(self.design_scale, self.offset_scale, self.shot_separation, self.spec_x, self.spec_y)
+            self.canvas.draw()
     
     @Slot(bool)
     def on_grid_toggled(self, checked):
         """切换是否显示网格"""
         self.canvas.show_grid = checked
-        self.canvas.update()
+        self.canvas.redraw_plot()
 
     @Slot()
     def on_clipboard_changed(self):
@@ -186,6 +228,7 @@ class MappingVisualizer(QMainWindow):
         self.polygons = {}  # {shot: {seq: point}}
         self.actual_polygons = {}  # {key: {shot: {seq: point}}}
         self.offset_data = {}  # {GLASS_ID_ENDTIME: {site_name: {param: value}}}
+        self.mean_polygon = {}  # {shot: {seq: point}}
         
         # 用于传递给Canvas的数据
         original_coords = {}  # {site_name: (x, y)}
@@ -231,7 +274,7 @@ class MappingVisualizer(QMainWindow):
                 # 构建理论多边形数据
                 if shot not in self.polygons:
                     self.polygons[shot] = {}
-                self.polygons[shot][seq] = QPointF(scaled_x, scaled_y)
+                self.polygons[shot][seq] = (scaled_x, scaled_y)
                 
             except (ValueError, KeyError) as e:
                 print(f"处理理论坐标时出错: {e}")
@@ -275,6 +318,9 @@ class MappingVisualizer(QMainWindow):
                 continue
         
         # 第三步：根据偏移量构建实际多边形
+        # 收集所有偏移量数据，用于计算均值
+        all_offsets = {}  # {site_name: [(offset_x, offset_y), ...]}
+        
         for glass_key, offsets in self.offset_data.items():
             self.actual_polygons[glass_key] = {}
             
@@ -291,6 +337,11 @@ class MappingVisualizer(QMainWindow):
                 # 获取X和Y偏移量，如果没有则默认为0
                 offset_x = params.get('POS_X1', 0) / self.offset_scale
                 offset_y = params.get('POS_Y1', 0) / self.offset_scale
+                
+                # 收集偏移量数据
+                if site_name not in all_offsets:
+                    all_offsets[site_name] = []
+                all_offsets[site_name].append((offset_x, offset_y))
                 
                 # 应用设计值缩放和Shot分离
                 x, y = site_theory_coords[site_name]
@@ -318,7 +369,53 @@ class MappingVisualizer(QMainWindow):
                 # 保存实际多边形数据
                 if shot not in self.actual_polygons[glass_key]:
                     self.actual_polygons[glass_key][shot] = {}
-                self.actual_polygons[glass_key][shot][seq] = QPointF(actual_x, actual_y)
+                self.actual_polygons[glass_key][shot][seq] = (actual_x, actual_y)
+        
+        # 第四步：计算均值多边形
+        for site_name, offset_list in all_offsets.items():
+            if site_name not in self.seq_data:
+                continue
+                
+            shot, seq = self.seq_data[site_name]
+            
+            # 获取该站点的理论坐标
+            if site_name not in site_theory_coords:
+                continue
+            
+            # 计算平均偏移量
+            if offset_list:
+                avg_offset_x = sum(o[0] for o in offset_list) / len(offset_list)
+                avg_offset_y = sum(o[1] for o in offset_list) / len(offset_list)
+            else:
+                avg_offset_x, avg_offset_y = 0, 0
+            
+            # 应用设计值缩放和Shot分离
+            x, y = site_theory_coords[site_name]
+            scaled_x = int(x / (self.design_scale * 1000))
+            scaled_y = int(y / (self.design_scale * 1000))
+            
+            # 应用Shot分离
+            if shot == 2:  # 右下
+                scaled_x += self.shot_separation
+                scaled_y -= self.shot_separation
+            elif shot == 3:  # 左下
+                scaled_x -= self.shot_separation
+                scaled_y -= self.shot_separation
+            elif shot == 4:  # 左上
+                scaled_x -= self.shot_separation
+                scaled_y += self.shot_separation
+            elif shot == 1:  # 右上
+                scaled_x += self.shot_separation
+                scaled_y += self.shot_separation
+            
+            # 计算均值坐标 = 理论坐标 + 平均偏移量
+            mean_x = scaled_x + avg_offset_x
+            mean_y = scaled_y + avg_offset_y
+            
+            # 保存均值多边形数据
+            if shot not in self.mean_polygon:
+                self.mean_polygon[shot] = {}
+            self.mean_polygon[shot][seq] = (mean_x, mean_y)
         
         # 更新状态并绘制
         theory_count = len(self.polygons)
@@ -328,12 +425,10 @@ class MappingVisualizer(QMainWindow):
         self.status_label.setText(status_text)
         
         # 设置参数并更新画布
-        self.canvas.set_params(self.design_scale, self.offset_scale, self.shot_separation)
+        self.canvas.set_params(self.design_scale, self.offset_scale, self.shot_separation, self.spec_x, self.spec_y)
         # 传递原始坐标和偏移量数据
-        self.canvas.seq_data = self.seq_data  # 传递seq_data以便鼠标悬停时查找
         self.canvas.set_original_data(original_coords, offset_values)
-        self.canvas.update_polygons(self.polygons, self.actual_polygons)
-        self.canvas.update()
+        self.canvas.update_polygons(self.polygons, self.actual_polygons, self.mean_polygon)
 
     @Slot()
     def on_zoom_in(self):
@@ -348,21 +443,20 @@ class MappingVisualizer(QMainWindow):
         self.canvas.reset_view()
 
 
-class Canvas(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumSize(QSize(600, 400))
-        self.setMouseTracking(True)  # 启用鼠标追踪
+class MatplotlibCanvas(FigureCanvas):
+    def __init__(self, parent=None, seq_data=None):
+        # 创建图形和坐标轴
+        self.fig = Figure(figsize=(5, 4), dpi=100)
+        self.axes = self.fig.add_subplot(111)
+        super().__init__(self.fig)
+        
+        # 设置父窗口
+        self.setParent(parent)
         
         # 绘图数据
         self.theory_polygons = {}  # {shot: {seq: point}}
         self.actual_polygon_sets = {}  # {key: {shot: {seq: point}}}
-        
-        # 绘图设置
-        self.scale_factor = 1.0
-        self.offset_x = 0
-        self.offset_y = 0
-        self.zoom_factor = 1.2
+        self.seq_data = seq_data or {}
         
         # 网格设置
         self.show_grid = True
@@ -372,405 +466,520 @@ class Canvas(QWidget):
         self.design_scale = 10.0
         self.offset_scale = 1.0
         self.shot_separation = 3
-        
-        # 鼠标相关
-        self.panning = False
-        self.last_mouse_pos = QPoint(0, 0)
-        self.hover_point = None
-        self.hover_info = ""
-        
-        # 颜色设置
-        self.theory_color = QColor(0, 0, 255, 200)  # 蓝色半透明
-        self.actual_colors = [
-            QColor(255, 0, 0, 200),     # 红色
-            QColor(0, 255, 0, 200),     # 绿色
-            QColor(255, 255, 0, 200),   # 黄色 
-            QColor(255, 0, 255, 200),   # 洋红
-            QColor(0, 255, 255, 200),   # 青色
-            QColor(255, 165, 0, 200),   # 橙色
-            QColor(128, 0, 128, 200),   # 紫色
-            QColor(0, 128, 0, 200)      # 深绿色
-        ]
-        
-        # 点信息映射：用于在鼠标悬停时显示
-        # {(x,y): {'type': 'theory/actual', 'shot': shot, 'seq': seq, 'key': key}}
-        self.point_info_map = {}
+        self.spec_x = 2.5
+        self.spec_y = 2.5
         
         # 存储原始坐标和偏移量数据，用于显示提示信息
         self.original_coords = {}  # {site_name: (x, y)}
         self.offset_values = {}    # {glass_key: {site_name: {'POS_X1': x, 'POS_Y1': y}}}
+        
+        # 绘图元素
+        self.theory_lines = []
+        self.theory_points = []
+        self.actual_lines = []
+        self.actual_points = []
+        self.mean_lines = []
+        self.mean_points = []
+        self.highlight_point = None
+        
+        # 悬停检测用
+        self.point_metadata = []  # 初始化point_metadata属性
+        self.point_kdtree = None
+        
+        # 颜色设置
+        self.theory_color = '#0047AB'  # 深钴蓝色 (Cobalt Blue)
+        self.mean_color = '#7CFC00'    # 草坪绿 (LawnGreen)
+        self.actual_color = '#FF4500'  # 橙红色 (OrangeRed)
+        
+        # 设置图形的初始样式
+        self.setup_figure()
+        
+        # 连接事件处理器
+        self.setup_events()
+        
+        # 鼠标操作相关
+        self.hover_info = ""
+        self.press_event = None
+        self.background = None
+        
+        # 初始绘制
+        self.draw()
     
-    def set_params(self, design_scale, offset_scale, shot_separation):
+    def set_params(self, design_scale, offset_scale, shot_separation, spec_x, spec_y):
         """设置缩放和偏移参数"""
         self.design_scale = design_scale
         self.offset_scale = offset_scale
         self.shot_separation = shot_separation
-    
-    def update_polygons(self, theory_polygons, actual_polygon_sets):
-        """更新多边形数据"""
-        self.theory_polygons = theory_polygons
-        self.actual_polygon_sets = actual_polygon_sets
-        
-        # 更新点信息映射
-        self.update_point_info_map()
-        
-        # 自动计算缩放和偏移以适应视图
-        self.auto_scale()
+        self.spec_x = spec_x
+        self.spec_y = spec_y
     
     def set_original_data(self, original_coords, offset_values):
         """设置原始坐标和偏移量数据，用于显示提示信息"""
         self.original_coords = original_coords
         self.offset_values = offset_values
     
-    def update_point_info_map(self):
-        """更新点信息映射，用于鼠标悬停显示"""
-        self.point_info_map = {}
+    def setup_figure(self):
+        """设置图形的初始样式"""
+        # 设置坐标轴属性
+        self.axes.set_aspect('equal')  # 等比例显示
+        self.axes.tick_params(axis='both', which='major', labelsize=8)
+        self.axes.tick_params(axis='both', which='minor', labelsize=6)
         
-        # 理论点
+        # 设置网格
+        self.axes.grid(self.show_grid, linestyle=':', color='gray', alpha=0.5)
+        
+        # 设置紧凑布局
+        self.fig.tight_layout(pad=0.1)
+    
+    def setup_events(self):
+        """连接事件处理器"""
+        self.mpl_connect('motion_notify_event', self.on_mouse_move)
+        self.mpl_connect('button_press_event', self.on_mouse_press)
+        self.mpl_connect('button_release_event', self.on_mouse_release)
+        self.mpl_connect('scroll_event', self.on_scroll)
+        self.mpl_connect('resize_event', self.on_resize_event)
+    
+    def update_polygons(self, theory_polygons, actual_polygon_sets, mean_polygon):
+        """更新多边形数据并重新绘制"""
+        self.theory_polygons = theory_polygons
+        self.actual_polygon_sets = actual_polygon_sets
+        self.mean_polygon = mean_polygon
+        self.redraw_plot()
+    
+    def redraw_plot(self):
+        """优化后的重新绘制图表函数"""
+        # 清除当前绘图
+        self.axes.clear()
+        self.theory_lines = []
+        self.theory_points = []
+        self.actual_lines = []
+        self.actual_points = []
+        self.mean_lines = []
+        self.mean_points = []
+        
+        # 重新设置网格
+        if self.show_grid:
+            self.axes.grid(True, linestyle=':', color='gray', alpha=0.5)
+            # 设置网格间隔为1
+            self.axes.xaxis.set_major_locator(plt.MultipleLocator(1))
+            self.axes.yaxis.set_major_locator(plt.MultipleLocator(1))
+        else:
+            self.axes.grid(False)
+        
+        # 存储点元数据用于悬停检测
+        self.point_metadata = []
+        
+        # ----- 绘制理论多边形 -----
         for shot, points in self.theory_polygons.items():
-            for seq, point in points.items():
-                key = (point.x(), point.y())
-                self.point_info_map[key] = {
-                    'type': 'theory',
-                    'shot': shot,
-                    'seq': seq
-                }
+            sorted_points = [points[seq] for seq in sorted(points.keys())]
+            if len(sorted_points) >= 2:
+                # 线条点（闭合多边形）
+                closed_points = sorted_points + [sorted_points[0]]
+                xs = [p[0] for p in closed_points]
+                ys = [p[1] for p in closed_points]
+                
+                # 绘制理论多边形线条
+                line, = self.axes.plot(xs, ys, color=self.theory_color, linewidth=2)
+                self.theory_lines.append(line)
+                
+                # 绘制理论多边形顶点
+                x_points = [p[0] for p in sorted_points]
+                y_points = [p[1] for p in sorted_points]
+                scatter = self.axes.scatter(x_points, y_points, 
+                                           color=self.theory_color,
+                                           edgecolors='black', 
+                                           s=15, zorder=5)
+                self.theory_points.append(scatter)
+                
+                # 收集理论点元数据
+                for seq, point in points.items():
+                    self.point_metadata.append((point[0], point[1], True, shot, seq, None))
+                
+                # 绘制规格值虚线框
+                for seq, point in points.items():
+                    x, y = point
+                    # 根据偏移量缩放计算规格值框
+                    spec_x_scaled = self.spec_x / self.offset_scale
+                    spec_y_scaled = self.spec_y / self.offset_scale
+                    
+                    # 绘制虚线框
+                    rect = plt.Rectangle(
+                        (x - spec_x_scaled, y - spec_y_scaled),
+                        2 * spec_x_scaled,
+                        2 * spec_y_scaled,
+                        linestyle='--',
+                        linewidth=1,
+                        edgecolor='#006400',  # 深绿色，更易于区分
+                        facecolor='none',
+                        alpha=0.7
+                    )
+                    self.axes.add_patch(rect)
         
-        # 实际点
+        # ----- 绘制均值多边形 -----
+        for shot, points in self.mean_polygon.items():
+            sorted_points = [points[seq] for seq in sorted(points.keys())]
+            if len(sorted_points) >= 2:
+                # 线条点（闭合多边形）
+                closed_points = sorted_points + [sorted_points[0]]
+                xs = [p[0] for p in closed_points]
+                ys = [p[1] for p in closed_points]
+                
+                # 绘制均值多边形线条
+                line, = self.axes.plot(xs, ys, color=self.mean_color, linewidth=2)
+                self.mean_lines.append(line)
+                
+                # 绘制均值多边形顶点
+                x_points = [p[0] for p in sorted_points]
+                y_points = [p[1] for p in sorted_points]
+                scatter = self.axes.scatter(x_points, y_points, 
+                                          color=self.mean_color,
+                                          edgecolors='black', 
+                                          s=15, zorder=5)
+                self.mean_points.append(scatter)
+                
+                # 收集均值点元数据
+                for seq, point in points.items():
+                    self.point_metadata.append((point[0], point[1], False, shot, seq, "均值"))
+        
+        # ----- 绘制实际多边形（只绘制点，不绘制线） -----
+        # 收集所有实际点
+        actual_points = []
+        
         for glass_key, polygon_set in self.actual_polygon_sets.items():
             for shot, points in polygon_set.items():
                 for seq, point in points.items():
-                    key = (point.x(), point.y())
-                    if key not in self.point_info_map:
-                        self.point_info_map[key] = []
-                    
-                    info = {
-                        'type': 'actual',
-                        'shot': shot,
-                        'seq': seq,
-                        'glass_key': glass_key
-                    }
-                    
-                    if isinstance(self.point_info_map[key], list):
-                        self.point_info_map[key].append(info)
-                    else:
-                        # 如果之前存储的不是列表（可能是理论点），将其转换为列表
-                        existing = self.point_info_map[key]
-                        self.point_info_map[key] = [existing, info]
+                    actual_points.append(point)
+                    # 收集实际点元数据
+                    self.point_metadata.append((point[0], point[1], False, shot, seq, glass_key))
+        
+        # 一次性绘制所有实际点
+        if actual_points:
+            x_actual = [p[0] for p in actual_points]
+            y_actual = [p[1] for p in actual_points]
+            scatter = self.axes.scatter(x_actual, y_actual, 
+                                       color=self.actual_color,
+                                       edgecolors='black', 
+                                       s=5, alpha=0.5, zorder=3)
+            self.actual_points.append(scatter)
+        
+        # 自动调整视图以显示所有多边形
+        self.auto_scale()
+        
+        # 初始化KDTree用于快速搜索
+        self.build_spatial_index()
+        
+        # 添加图例
+        self.axes.plot([], [], color=self.theory_color, linewidth=1, label='设计坐标')
+        self.axes.plot([], [], color=self.mean_color, linewidth=1, label='实做均值')
+        self.axes.scatter([], [], color=self.actual_color, s=5, alpha=0.5, label='实做点')
+        self.axes.legend(loc='upper right')
+        
+        # 重新绘制
+        self.draw()
     
     def auto_scale(self):
-        """自动计算缩放和偏移"""
-        # 如果没有数据，不进行缩放
+        """自动调整坐标轴以适应所有多边形"""
         if not self.theory_polygons and not self.actual_polygon_sets:
             return
         
-        # 查找所有点的范围
-        min_x, max_x = float('inf'), float('-inf')
-        min_y, max_y = float('inf'), float('-inf')
+        all_points = []
         
-        # 检查理论多边形
+        # 收集所有点
         for shot, points in self.theory_polygons.items():
             for seq, point in points.items():
-                min_x = min(min_x, point.x())
-                max_x = max(max_x, point.x())
-                min_y = min(min_y, point.y())
-                max_y = max(max_y, point.y())
+                all_points.append(point)
         
-        # 检查实际多边形
         for key, polygon_set in self.actual_polygon_sets.items():
             for shot, points in polygon_set.items():
                 for seq, point in points.items():
-                    min_x = min(min_x, point.x())
-                    max_x = max(max_x, point.x())
-                    min_y = min(min_y, point.y())
-                    max_y = max(max_y, point.y())
+                    all_points.append(point)
         
-        # 确保有数据
-        if min_x == float('inf') or max_x == float('-inf') or min_y == float('inf') or max_y == float('-inf'):
+        if not all_points:
             return
         
-        # 计算缩放因子
-        width = max_x - min_x
-        height = max_y - min_y
+        # 计算边界
+        x_coords = [p[0] for p in all_points]
+        y_coords = [p[1] for p in all_points]
         
-        if width <= 0 or height <= 0:
-            return
+        x_min, x_max = min(x_coords), max(x_coords)
+        y_min, y_max = min(y_coords), max(y_coords)
         
-        # 考虑边距
-        margin = 50
-        view_width = self.width() - 2 * margin
-        view_height = self.height() - 2 * margin
+        # 添加边距 - 减小padding以减少留白
+        padding = 0.1
+        x_range = x_max - x_min
+        y_range = y_max - y_min
         
-        scale_x = view_width / width
-        scale_y = view_height / height
-        self.scale_factor = min(scale_x, scale_y)
+        # 确保有最小范围
+        if x_range < 1e-10:
+            x_range = 1
+        if y_range < 1e-10:
+            y_range = 1
         
-        # 计算偏移量，使图形居中
-        self.offset_x = margin - min_x * self.scale_factor + (view_width - width * self.scale_factor) / 2
-        self.offset_y = margin - min_y * self.scale_factor + (view_height - height * self.scale_factor) / 2
+        x_padding = padding * x_range
+        y_padding = padding * y_range
         
-        self.update()
+        # 设置坐标轴范围
+        self.axes.set_xlim(x_min - x_padding, x_max + x_padding)
+        self.axes.set_ylim(y_min - y_padding, y_max + y_padding)
     
     def zoom_in(self):
         """放大视图"""
-        self.scale_factor *= self.zoom_factor
-        self.update()
+        self.zoom(1.2)
     
     def zoom_out(self):
         """缩小视图"""
-        self.scale_factor /= self.zoom_factor
-        self.update()
+        self.zoom(1/1.2)
+    
+    def zoom(self, factor):
+        """缩放视图"""
+        # 获取当前视图范围
+        x_min, x_max = self.axes.get_xlim()
+        y_min, y_max = self.axes.get_ylim()
+        
+        # 计算中心点
+        x_center = (x_min + x_max) / 2
+        y_center = (y_min + y_max) / 2
+        
+        # 计算新范围
+        x_range = (x_max - x_min) / factor
+        y_range = (y_max - y_min) / factor
+        
+        # 设置新范围
+        self.axes.set_xlim(x_center - x_range/2, x_center + x_range/2)
+        self.axes.set_ylim(y_center - y_range/2, y_center + y_range/2)
+        
+        # 重新绘制
+        self.draw_idle()
     
     def reset_view(self):
         """重置视图"""
         self.auto_scale()
+        self.draw_idle()
     
-    def mousePressEvent(self, event):
-        """鼠标按下事件"""
-        if event.button() == Qt.MiddleButton or event.button() == Qt.LeftButton:
-            self.panning = True
-            self.last_mouse_pos = event.position().toPoint()
-            self.setCursor(Qt.ClosedHandCursor)
-    
-    def mouseReleaseEvent(self, event):
-        """鼠标释放事件"""
-        if event.button() == Qt.MiddleButton or event.button() == Qt.LeftButton:
-            self.panning = False
-            self.setCursor(Qt.ArrowCursor)
-    
-    def mouseMoveEvent(self, event):
+    def on_mouse_move(self, event):
         """鼠标移动事件"""
-        if self.panning:
-            # 平移视图
-            delta = event.position().toPoint() - self.last_mouse_pos
-            self.offset_x += delta.x()
-            self.offset_y += delta.y()
-            self.last_mouse_pos = event.position().toPoint()
-            self.update()
-        else:
-            # 鼠标悬停显示点信息
-            self.check_hover(event.position().toPoint())
-    
-    def check_hover(self, mouse_pos):
-        """检查鼠标是否悬停在点上"""
-        self.hover_point = None
-        self.hover_info = ""
+        if not event.inaxes:
+            return
         
-        # 检查所有点
-        for key, info in self.point_info_map.items():
-            x, y = key
-            # 将数据坐标转换为屏幕坐标
-            screen_x = x * self.scale_factor + self.offset_x
-            screen_y = y * self.scale_factor + self.offset_y
+        if self.press_event and (event.button == MouseButton.LEFT or event.button == MouseButton.MIDDLE):
+            # 处理拖动 - 平移视图
+            dx = event.xdata - self.press_event.xdata
+            dy = event.ydata - self.press_event.ydata
             
-            # 检查鼠标是否在点的附近
-            if abs(mouse_pos.x() - screen_x) < 10 and abs(mouse_pos.y() - screen_y) < 10:
-                self.hover_point = QPointF(screen_x, screen_y)
-                
-                # 设置悬停信息
-                if isinstance(info, list):
-                    # 处理多个信息的情况
-                    for item in info:
-                        if item['type'] == 'theory':
-                            # 显示理论点的原始坐标
-                            shot, seq = item['shot'], item['seq']
-                            self.hover_info = f"理论点 - Shot: {shot}\n"
-                            # 找到对应的原始坐标
-                            for site_name, (orig_x, orig_y) in self.original_coords.items():
-                                if self.seq_data.get(site_name) == (shot, seq):
-                                    self.hover_info += f"原始坐标: ({orig_x}, {orig_y})"
-                                    break
-                        else:
-                            # 显示实际点的偏移量
-                            glass_key = item['glass_key']
-                            shot, seq = item['shot'], item['seq']
-                            self.hover_info += f"实际点 - Shot: {shot}\nGlass: {glass_key}\n"
-                            # 找到对应的偏移量
-                            for site_name, offsets in self.offset_values.get(glass_key, {}).items():
-                                if self.seq_data.get(site_name) == (shot, seq):
-                                    x_offset = offsets.get('POS_X1', 0)
-                                    y_offset = offsets.get('POS_Y1', 0)
-                                    self.hover_info += f"偏移量: X={x_offset}, Y={y_offset}"
-                                    break
-                else:
-                    # 单个信息
-                    if info['type'] == 'theory':
-                        # 显示理论点的原始坐标
-                        shot, seq = info['shot'], info['seq']
-                        self.hover_info = f"理论点 - Shot: {shot}\n"
-                        # 找到对应的原始坐标
-                        for site_name, (orig_x, orig_y) in self.original_coords.items():
-                            if self.seq_data.get(site_name) == (shot, seq):
-                                self.hover_info += f"原始坐标: ({orig_x}, {orig_y})"
-                                break
-                    else:
-                        # 显示实际点的偏移量
-                        glass_key = info['glass_key']
-                        shot, seq = info['shot'], info['seq']
-                        self.hover_info = f"实际点 - Shot: {shot}\nGlass: {glass_key}\n"
-                        # 找到对应的偏移量
-                        for site_name, offsets in self.offset_values.get(glass_key, {}).items():
-                            if self.seq_data.get(site_name) == (shot, seq):
-                                x_offset = offsets.get('POS_X1', 0)
-                                y_offset = offsets.get('POS_Y1', 0)
-                                self.hover_info += f"偏移量: X={x_offset}, Y={y_offset}"
-                                break
-                
-                # 显示工具提示
-                QToolTip.showText(self.mapToGlobal(mouse_pos), self.hover_info)
-                self.update()
-                return
-        
-        # 如果没有找到点，隐藏工具提示
-        QToolTip.hideText()
-        self.update()
+            # 获取当前视图范围
+            x_min, x_max = self.axes.get_xlim()
+            y_min, y_max = self.axes.get_ylim()
+            
+            # 计算新范围
+            self.axes.set_xlim(x_min - dx, x_max - dx)
+            self.axes.set_ylim(y_min - dy, y_max - dy)
+            
+            # 更新按下位置
+            self.press_event.xdata = event.xdata
+            self.press_event.ydata = event.ydata
+            
+            # 直接重绘，不使用blitting技术（更可靠）
+            self.draw_idle()
+        else:
+            # 检查鼠标悬停
+            self.check_hover(event)
     
-    def wheelEvent(self, event):
+    def on_mouse_press(self, event):
+        """鼠标按下事件"""
+        if not event.inaxes:
+            return
+        
+        if event.button == MouseButton.LEFT or event.button == MouseButton.MIDDLE:
+            # 开始拖动
+            self.press_event = event
+    
+    def on_mouse_release(self, event):
+        """鼠标释放事件"""
+        self.press_event = None
+    
+    def on_scroll(self, event):
         """鼠标滚轮事件 - 用于缩放"""
-        delta = event.angleDelta().y()
+        if not event.inaxes:
+            return
+        
+        # 获取当前视图范围
+        x_min, x_max = self.axes.get_xlim()
+        y_min, y_max = self.axes.get_ylim()
+        
+        # 计算缩放因子
+        factor = 1.1 if event.button == 'up' else 1/1.1
+        
+        # 计算鼠标位置的比例
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        x_rel = (event.xdata - x_min) / x_range
+        y_rel = (event.ydata - y_min) / y_range
+        
+        # 计算新范围
+        new_x_range = x_range / factor
+        new_y_range = y_range / factor
+        
+        # 设置新范围，保持鼠标位置不变
+        self.axes.set_xlim(
+            event.xdata - x_rel * new_x_range,
+            event.xdata + (1 - x_rel) * new_x_range
+        )
+        self.axes.set_ylim(
+            event.ydata - y_rel * new_y_range,
+            event.ydata + (1 - y_rel) * new_y_range
+        )
+        
+        # 重新绘制
+        self.draw_idle()
+    
+    def on_resize_event(self, event):
+        """窗口大小改变时清除背景缓存"""
+        # 不再需要background
+        # 更新布局
+        self.fig.tight_layout(pad=0.1)
+        self.draw_idle()
+    
+    def build_spatial_index(self):
+        """构建空间索引用于快速点查找"""
+        try:
+            from scipy.spatial import KDTree
+            import numpy as np
+            
+            # 构建所有点的坐标数组
+            if not hasattr(self, 'point_metadata') or not self.point_metadata:
+                return
+                
+            coordinates = np.array([(x, y) for x, y, *_ in self.point_metadata])
+            
+            # 创建KDTree
+            self.point_kdtree = KDTree(coordinates)
+        except ImportError:
+            print("警告: 未安装scipy，将使用暴力搜索")
+            self.point_kdtree = None
+
+    def check_hover(self, event):
+        """优化后的鼠标悬停检测"""
+        if not event.inaxes:
+            # 鼠标不在坐标轴内
+            return
+            
+        # 删除之前的高亮点
+        if self.highlight_point:
+            self.highlight_point.remove()
+            self.highlight_point = None
         
         # 获取鼠标位置
-        mouse_pos = event.position().toPoint()
+        mx, my = event.xdata, event.ydata
+        closest_point = None
+        hover_info = None
+        site_name = None
         
-        # 计算鼠标在数据坐标系中的位置
-        mouse_x = (mouse_pos.x() - self.offset_x) / self.scale_factor
-        mouse_y = (mouse_pos.y() - self.offset_y) / self.scale_factor
+        # 设置距离阈值
+        distance_threshold = 0.5
         
-        # 根据滚轮方向缩放
-        if delta > 0:
-            self.scale_factor *= self.zoom_factor
-        else:
-            self.scale_factor /= self.zoom_factor
-        
-        # 调整偏移以保持鼠标下的点不变
-        self.offset_x = mouse_pos.x() - mouse_x * self.scale_factor
-        self.offset_y = mouse_pos.y() - mouse_y * self.scale_factor
-        
-        self.update()
-    
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.auto_scale()
-    
-    def paintEvent(self, event):
-        if not self.theory_polygons and not self.actual_polygon_sets:
+        # 确保point_metadata已初始化
+        if not hasattr(self, 'point_metadata') or not self.point_metadata:
+            # 如果没有点数据，直接返回
+            self.draw_idle()
             return
-            
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
         
-        # 保存当前的变换矩阵
-        painter.save()
-        
-        # 应用Y轴翻转，使Y轴正向朝上
-        painter.translate(0, self.height())
-        painter.scale(1, -1)
-        
-        # 绘制理论多边形
-        for shot, points in self.theory_polygons.items():
-            self.draw_polygon(painter, points, self.theory_color)
-        
-        # 绘制实际多边形
-        for i, (key, polygon_set) in enumerate(self.actual_polygon_sets.items()):
-            color = self.actual_colors[i % len(self.actual_colors)]
-            for shot, points in polygon_set.items():
-                self.draw_polygon(painter, points, color)
-        
-        # 如果有悬停点，绘制高亮
-        if self.hover_point:
-            painter.setPen(QPen(Qt.black, 3))
-            painter.setBrush(Qt.red)
-            flipped_y = self.height() - self.hover_point.y()
-            painter.drawEllipse(QPointF(self.hover_point.x(), flipped_y), 5, 5)
-        
-        # 恢复变换矩阵
-        painter.restore()
-        
-        # 绘制网格 - 在最上层绘制网格
-        if self.show_grid:
-            self.draw_grid(painter)
-    
-    def draw_grid(self, painter):
-        """绘制网格"""
-        # 设置网格线颜色和样式
-        painter.setPen(QPen(QColor(200, 200, 200, 100), 1, Qt.DotLine))
-        
-        # 计算网格范围
-        view_width = self.width()
-        view_height = self.height()
-        
-        # 计算数据坐标系统中的网格范围
-        min_x = (0 - self.offset_x) / self.scale_factor
-        max_x = (view_width - self.offset_x) / self.scale_factor
-        min_y = (0 - self.offset_y) / self.scale_factor
-        max_y = (view_height - self.offset_y) / self.scale_factor
-        
-        # 计算网格线开始和结束的位置
-        grid_spacing = self.grid_spacing  # 数据坐标系统中的网格间距
-        
-        # 计算网格起始点，确保它们是网格间距的整数倍
-        start_x = int(min_x / grid_spacing) * grid_spacing
-        start_y = int(min_y / grid_spacing) * grid_spacing
-        
-        # 垂直网格线
-        x = start_x
-        while x <= max_x:
-            screen_x = x * self.scale_factor + self.offset_x
-            painter.drawLine(QPointF(screen_x, 0), QPointF(screen_x, view_height))
-            x += grid_spacing
-        
-        # 水平网格线
-        y = start_y
-        while y <= max_y:
-            screen_y = y * self.scale_factor + self.offset_y
-            painter.drawLine(QPointF(0, screen_y), QPointF(view_width, screen_y))
-            y += grid_spacing
-    
-    def draw_polygon(self, painter, points_dict, color):
-        """绘制一个多边形"""
-        if not points_dict:
-            return
-            
-        # 按序号排序点
-        sorted_points = []
-        seqs = sorted(points_dict.keys())
-        for seq in seqs:
-            if seq in points_dict:
-                sorted_points.append(points_dict[seq])
-        
-        # 如果有点，确保首尾相连
-        if sorted_points and len(sorted_points) >= 2:
-            sorted_points.append(sorted_points[0])
-        else:
-            return
-            
-        # 创建多边形并应用缩放和偏移（注意Y坐标是在painter中翻转的）
-        polygon = QPolygonF()
-        for point in sorted_points:
-            scaled_x = point.x() * self.scale_factor + self.offset_x
-            scaled_y = point.y() * self.scale_factor + self.offset_y
-            polygon.append(QPointF(scaled_x, scaled_y))
-        
-        # 设置画笔
-        pen = QPen(color, 2)
-        painter.setPen(pen)
-        
-        # 绘制多边形
-        painter.drawPolyline(polygon)
-        
-        # 绘制顶点，但不显示序号
-        for i, seq in enumerate(seqs):
-            if seq not in points_dict:
-                continue
+        try:
+            # 找到最近的点
+            if hasattr(self, 'point_kdtree') and self.point_kdtree is not None:
+                # 使用KDTree快速搜索
+                distances, indices = self.point_kdtree.query([mx, my], k=1)
                 
-            point = points_dict[seq]
-            x = point.x() * self.scale_factor + self.offset_x
-            y = point.y() * self.scale_factor + self.offset_y
+                if distances < distance_threshold:
+                    # 找到了足够近的点
+                    index = indices
+                    x, y, is_theory, shot, seq, glass_key = self.point_metadata[index]
+                    closest_point = (x, y)
+                else:
+                    # 没有找到足够近的点
+                    self.draw_idle()
+                    QToolTip.hideText()
+                    return
+            else:
+                # 暴力搜索（备用方案）
+                min_dist = float('inf')
+                index = -1
+                for i, (x, y, is_theory, shot, seq, glass_key) in enumerate(self.point_metadata):
+                    dist = np.sqrt((x - mx)**2 + (y - my)**2)
+                    if dist < min_dist and dist < distance_threshold:
+                        min_dist = dist
+                        closest_point = (x, y)
+                        index = i
+                
+                if index == -1:
+                    # 没有找到足够近的点
+                    self.draw_idle()
+                    QToolTip.hideText()
+                    return
+                
+                # 获取最近点的信息
+                x, y, is_theory, shot, seq, glass_key = self.point_metadata[index]
             
-            # 绘制点
-            painter.setBrush(color)
-            painter.setPen(QPen(Qt.black, 1))
-            painter.drawEllipse(QPointF(x, y), 3, 3)
+            # 找到站点名称
+            for site_name_tmp, (shot_tmp, seq_tmp) in self.seq_data.items():
+                if shot_tmp == shot and seq_tmp == seq:
+                    site_name = site_name_tmp
+                    break
+            
+            # 构建悬停信息
+            if is_theory:
+                hover_info = f"理论点 - Shot: {shot}\nSite: {site_name}\n"
+                # 查找原始坐标
+                if site_name in self.original_coords:
+                    orig_x, orig_y = self.original_coords[site_name]
+                    hover_info += f"原始坐标: ({orig_x}, {orig_y})"
+            elif glass_key == "均值":
+                hover_info = f"均值点 - Shot: {shot}\nSite: {site_name}"
+            else:
+                # 为实际点构建悬停信息
+                hover_info = f"实做点 - Shot: {shot}\nSite: {site_name}\nGlass: {glass_key}\n"
+                # 查找偏移量
+                if glass_key in self.offset_values and site_name in self.offset_values[glass_key]:
+                    offsets = self.offset_values[glass_key][site_name]
+                    x_offset = offsets.get('POS_X1', 0)
+                    y_offset = offsets.get('POS_Y1', 0)
+                    hover_info += f"偏移量: X={x_offset}, Y={y_offset}"
+            
+            # 如果找到了点，显示高亮和工具提示
+            if closest_point and hover_info:
+                # 绘制高亮点
+                self.highlight_point = self.axes.scatter(
+                    closest_point[0], 
+                    closest_point[1], 
+                    color='red', 
+                    edgecolors='black', 
+                    s=100, 
+                    alpha=0.5,
+                    zorder=10
+                )
+                
+                # 显示工具提示 - 修正Y坐标，将event.y改为figure高度减去event.y
+                fig_height = self.figure.bbox.height
+                corrected_y = fig_height - event.y  # 修正Y坐标
+                QToolTip.showText(
+                    self.mapToGlobal(QPoint(event.x, event.y)),
+                    hover_info
+                )
+                
+                # 更新绘图
+                self.draw_idle()
+            else:
+                QToolTip.hideText()
+                self.draw_idle()
+                
+        except Exception as e:
+            print(f"悬停检测时出错: {e}")
+            self.draw_idle()
+            return
+
+    def on_resize(self, event):
+        """窗口大小改变事件"""
+        self.fig.tight_layout(pad=0.1)
+        self.draw()
 
 
 if __name__ == "__main__":
